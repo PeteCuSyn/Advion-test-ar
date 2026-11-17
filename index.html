@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Meet Your New Employee – AR card prototype</title>
+<style>
+  :root { --bg:#181c28; --ink:#f0e4cd; --accent:#e87828; --muted:#96a0b9; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow:hidden; }
+  #ar, #preview { position:fixed; inset:0; }
+  #preview canvas { display:block; }
+  .screen { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:18px; padding:28px; text-align:center; z-index:10;
+    background:radial-gradient(circle at 50% 30%, #262c40 0%, var(--bg) 70%); }
+  .hidden { display:none !important; }
+  h1 { margin:0; font-size:clamp(28px,7vw,44px); line-height:1.05; letter-spacing:.5px; }
+  h1 span { color:var(--accent); }
+  p { margin:0; max-width:420px; color:var(--muted); line-height:1.45; }
+  .card-thumb { width:min(320px,80vw); border-radius:12px; box-shadow:0 10px 30px #0008; }
+  button, a.btn { appearance:none; border:0; border-radius:999px; padding:15px 26px; font-size:17px;
+    font-weight:700; cursor:pointer; text-decoration:none; display:inline-block; }
+  .primary { background:var(--accent); color:#1a1206; }
+  .ghost { background:transparent; color:var(--ink); border:2px solid #ffffff33 !important; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; justify-content:center; }
+  .small { font-size:13px; }
+  .small a { color:var(--ink); }
+  #status { position:fixed; left:50%; bottom:calc(24px + env(safe-area-inset-bottom)); transform:translateX(-50%);
+    background:#000a; padding:10px 16px; border-radius:999px; font-size:14px; z-index:20; white-space:nowrap; }
+  #bar { width:min(320px,80vw); height:8px; border-radius:8px; background:#ffffff1a; overflow:hidden; }
+  #bar > i { display:block; height:100%; width:0; background:var(--accent); transition:width .2s; }
+  #close { position:fixed; top:calc(14px + env(safe-area-inset-top)); right:14px; z-index:30;
+    width:44px; height:44px; padding:0; border-radius:50%; background:#000a; color:#fff; font-size:22px; }
+  #tools { position:fixed; top:calc(14px + env(safe-area-inset-top)); left:14px; z-index:30; }
+  #tools button { padding:10px 14px; font-size:13px; background:#000a; color:#fff; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "mindar-image-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js"
+} }
+</script>
+</head>
+<body>
+<div id="ar"></div>
+<div id="preview" class="hidden"></div>
+
+<section id="home" class="screen">
+  <h1>Meet your<br><span>new employee</span></h1>
+  <img class="card-thumb" src="target.png" alt="The AR target card">
+  <p>Point your camera at this card – printed, or on another screen – and The Inspector reports for duty.</p>
+  <div class="row">
+    <button id="startAR" class="primary">Start camera</button>
+    <button id="startPreview" class="ghost">3D preview (no card)</button>
+  </div>
+  <p class="small"><a href="print-card-a4.pdf" target="_blank" rel="noopener">Printable card (A4 PDF)</a> · <a href="target.png" target="_blank" rel="noopener">card image</a></p>
+</section>
+
+<section id="loading" class="screen hidden">
+  <h1 style="font-size:24px">Briefing The Inspector…</h1>
+  <div id="bar"><i></i></div>
+  <p id="loadMsg">Preparing card recognition</p>
+</section>
+
+<section id="error" class="screen hidden">
+  <h1 style="font-size:24px">Camera didn't start</h1>
+  <p id="errMsg"></p>
+  <button class="ghost" onclick="location.reload()">Try again</button>
+</section>
+
+<button id="close" class="hidden" aria-label="Close">×</button>
+<div id="tools" class="hidden"><button id="saveMind">Download targets.mind</button></div>
+<div id="status" class="hidden"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+const $ = id => document.getElementById(id);
+const show = (id, on = true) => $(id).classList.toggle('hidden', !on);
+const status = msg => { $('status').textContent = msg; show('status', !!msg); };
+const progress = (pct, msg) => { $('bar').firstElementChild.style.width = pct + '%'; if (msg) $('loadMsg').textContent = msg; };
+
+// ---------- model ----------
+const MODEL_URL = 'inspector.glb';
+const CARD_ASPECT = 550 / 850;          // target image height / width
+let modelPromise;
+function loadModel() {
+  const loader = new GLTFLoader();
+  modelPromise ??= loader.loadAsync(MODEL_URL).catch(async () => {
+    // fallback for hosts that won't serve .glb: model embedded as base64 in a JS module
+    const { GLB_BASE64 } = await import('./inspector-model.js');
+    const bytes = Uint8Array.from(atob(GLB_BASE64), c => c.charCodeAt(0));
+    return loader.parseAsync(bytes.buffer, '');
+  }).then(gltf => {
+    const m = gltf.scene;
+    m.traverse(o => { if (o.isMesh) { o.castShadow = false; o.frustumCulled = false; } });
+    // normalise: feet at y=0, centred, height = 0.85 card widths
+    const box = new THREE.Box3().setFromObject(m), size = box.getSize(new THREE.Vector3()), c = box.getCenter(new THREE.Vector3());
+    const s = 0.85 / size.y;
+    m.scale.setScalar(s);
+    m.position.set(-c.x * s, -box.min.y * s, -c.z * s);
+    const wrap = new THREE.Group(); wrap.add(m);
+    return wrap;
+  });
+  return modelPromise;
+}
+
+function makeShadow() {
+  const cv = document.createElement('canvas'); cv.width = cv.height = 128;
+  const g = cv.getContext('2d'), grd = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+  grd.addColorStop(0, 'rgba(0,0,0,0.55)'); grd.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = grd; g.fillRect(0, 0, 128, 128);
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(0.45, 0.3),
+    new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(cv), transparent: true, depthWrite: false }));
+  return mesh;
+}
+
+function addLights(scene, renderer) {
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 1.2));
+  const sun = new THREE.DirectionalLight(0xffffff, 1.6); sun.position.set(0.5, 1, 1.2); scene.add(sun);
+}
+
+// Rig: "stage" sits flat on the card (card plane = XY, Z out of card).
+// Inside it, an upright group (Y up) holds shadow + floating model.
+function buildRig(model) {
+  const stage = new THREE.Group();
+  const upright = new THREE.Group(); upright.rotation.x = Math.PI / 2; stage.add(upright);
+  const shadow = makeShadow(); shadow.rotation.x = -Math.PI / 2; shadow.position.y = 0.002; upright.add(shadow);
+  const floater = new THREE.Group(); floater.add(model); upright.add(floater);
+  let appear = 0, t0 = performance.now();
+  return {
+    stage,
+    reset() { appear = 0; t0 = performance.now(); },
+    tick(dt) {
+      const t = (performance.now() - t0) / 1000;
+      appear = Math.min(1, appear + dt * 2.2);
+      const pop = 1 - Math.pow(1 - appear, 3) + Math.sin(appear * Math.PI) * 0.12;   // ease-out with overshoot
+      const hover = 0.06 + Math.sin(t * 1.8) * 0.025;
+      floater.position.y = hover * appear;
+      floater.rotation.y = Math.sin(t * 0.6) * 0.5;                                    // looks left and right
+      floater.scale.setScalar(Math.max(pop, 0.001));
+      const k = 1 - hover * 2; shadow.scale.set(k, k, k); shadow.material.opacity = appear * (0.6 + k * 0.4);
+    }
+  };
+}
+
+// ---------- target file: baked targets.mind, cached compile, or compile now ----------
+const IDB = { db: null };
+function idb() {
+  return IDB.db ??= new Promise((res, rej) => {
+    const r = indexedDB.open('ar-card', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+}
+async function idbGet(k) { try { const db = await idb(); return await new Promise(r => { const q = db.transaction('kv').objectStore('kv').get(k); q.onsuccess = () => r(q.result); q.onerror = () => r(null); }); } catch { return null; } }
+async function idbSet(k, v) { try { const db = await idb(); db.transaction('kv', 'readwrite').objectStore('kv').put(v, k); } catch {} }
+
+let compiledBuffer = null;
+async function getTargetSrc() {
+  try {
+    const r = await fetch('targets.mind', { cache: 'no-cache' });
+    if (r.ok && (r.headers.get('content-type') || '').indexOf('html') === -1) { progress(40, 'Card data loaded'); return 'targets.mind'; }
+  } catch {}
+  const key = 'target-v1';
+  let buf = await idbGet(key);
+  if (!buf) {
+    progress(5, 'Learning the card (first run only, ~10 s)…');
+    const mod = await import('https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image.prod.js');
+    const Compiler = mod.Compiler || window.MINDAR?.IMAGE?.Compiler;
+    const img = new Image(); img.src = 'target.png'; await img.decode();
+    const compiler = new Compiler();
+    await compiler.compileImageTargets([img], p => progress(5 + p * 0.35, `Learning the card… ${Math.round(p)}%`));
+    buf = await compiler.exportData();
+    await idbSet(key, buf);
+  }
+  compiledBuffer = buf;
+  show('tools');
+  return URL.createObjectURL(new Blob([buf]));
+}
+
+$('saveMind').onclick = () => {
+  if (!compiledBuffer) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([compiledBuffer])); a.download = 'targets.mind'; a.click();
+};
+
+// ---------- AR mode ----------
+$('startAR').onclick = async () => {
+  show('home', false); show('loading');
+  try {
+    const [{ MindARThree }, targetSrc] = await Promise.all([import('mindar-image-three'), getTargetSrc()]);
+    progress(45, 'Waking The Inspector…');
+    const model = await loadModel();
+    progress(80, 'Starting camera…');
+
+    const mindar = new MindARThree({
+      container: $('ar'), imageTargetSrc: targetSrc,
+      uiLoading: 'no', uiScanning: 'yes', uiError: 'yes',
+      filterMinCF: 0.0001, filterBeta: 0.001        // smoother, less jitter
+    });
+    const { renderer, scene, camera } = mindar;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    addLights(scene, renderer);
+
+    const anchor = mindar.addAnchor(0);
+    const rig = buildRig(model);
+    anchor.group.add(rig.stage);
+    let visible = false;
+    anchor.onTargetFound = () => { visible = true; rig.reset(); status(''); };
+    anchor.onTargetLost = () => { visible = false; status('Card lost – point back at it'); };
+
+    await mindar.start();
+    show('loading', false); show('close');
+    status('Point at the card');
+    const clock = new THREE.Clock();
+    renderer.setAnimationLoop(() => { const dt = clock.getDelta(); if (visible) rig.tick(dt); renderer.render(scene, camera); });
+    $('close').onclick = () => { renderer.setAnimationLoop(null); mindar.stop(); location.reload(); };
+  } catch (e) {
+    console.error(e);
+    show('loading', false); show('error');
+    $('errMsg').textContent = (e && e.name === 'NotAllowedError')
+      ? 'Camera permission was blocked. Allow camera access for this site in your browser settings, then try again.'
+      : 'This needs a phone browser with camera access over HTTPS (Safari on iPhone, Chrome on Android). Details: ' + (e?.message || e);
+  }
+};
+
+// ---------- preview mode (desktop / no card) ----------
+$('startPreview').onclick = async () => {
+  show('home', false); show('preview'); show('close'); status('Loading model…');
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); renderer.setSize(innerWidth, innerHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  $('preview').appendChild(renderer.domElement);
+  const scene = new THREE.Scene(); scene.background = new THREE.Color(0x181c28);
+  const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.01, 50);
+  camera.position.set(0.15, 0.75, 1.45);
+  addLights(scene, renderer);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 0.35, 0); controls.enableDamping = true; controls.maxPolarAngle = Math.PI * 0.49;
+
+  // virtual card lying on a "desk"
+  const tex = await new THREE.TextureLoader().loadAsync('target.png'); tex.colorSpace = THREE.SRGBColorSpace;
+  const card = new THREE.Mesh(new THREE.PlaneGeometry(1, CARD_ASPECT), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.8 }));
+  card.rotation.x = -Math.PI / 2; scene.add(card);
+  const desk = new THREE.Mesh(new THREE.CircleGeometry(3, 64), new THREE.MeshStandardMaterial({ color: 0x2a3042, roughness: 1 }));
+  desk.rotation.x = -Math.PI / 2; desk.position.y = -0.001; scene.add(desk);
+
+  const rig = buildRig(await loadModel());
+  rig.stage.rotation.x = -Math.PI / 2;       // card plane XY → floor XZ, matches AR anchor orientation
+  scene.add(rig.stage); status('Drag to orbit · pinch to zoom');
+  setTimeout(() => status(''), 3500);
+  const clock = new THREE.Clock();
+  renderer.setAnimationLoop(() => { rig.tick(clock.getDelta()); controls.update(); renderer.render(scene, camera); });
+  addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+  $('close').onclick = () => location.reload();
+};
+</script>
+</body>
+</html>
